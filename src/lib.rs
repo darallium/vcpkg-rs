@@ -407,15 +407,37 @@ fn validate_vcpkg_root(path: &PathBuf) -> Result<(), Error> {
 }
 
 fn find_vcpkg_target(cfg: &Config, target_triplet: &TargetTriplet) -> Result<VcpkgTarget, Error> {
-    let vcpkg_root = try!(find_vcpkg_root(&cfg));
-    try!(validate_vcpkg_root(&vcpkg_root));
-
-    let mut base = cfg
+    // Check if VCPKG_INSTALLED_ROOT is set (via config or env var)
+    let vcpkg_installed_root = cfg
         .vcpkg_installed_root
         .clone()
-        .or(env::var_os("VCPKG_INSTALLED_ROOT").map(PathBuf::from))
-        .unwrap_or(vcpkg_root.join("installed"));
+        .or(env::var_os("VCPKG_INSTALLED_ROOT").map(PathBuf::from));
 
+    // If VCPKG_INSTALLED_ROOT is set, we don't require VCPKG_ROOT
+    // This is important for manifest mode where the installed root is project-local
+    let (base, packages_path) = if let Some(installed_root) = vcpkg_installed_root {
+        // Try to find vcpkg_root for packages_path, but don't fail if it's not found
+        let packages_path = find_vcpkg_root(&cfg)
+            .ok()
+            .and_then(|root| {
+                if validate_vcpkg_root(&root).is_ok() {
+                    Some(root.join("packages"))
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| installed_root.join("packages"));
+        (installed_root, packages_path)
+    } else {
+        // Fall back to finding vcpkg_root the traditional way
+        let vcpkg_root = try!(find_vcpkg_root(&cfg));
+        try!(validate_vcpkg_root(&vcpkg_root));
+        let base = vcpkg_root.join("installed");
+        let packages_path = vcpkg_root.join("packages");
+        (base, packages_path)
+    };
+
+    let mut base = base;
     let status_path = base.join("vcpkg");
 
     base.push(&target_triplet.triplet);
@@ -423,7 +445,6 @@ fn find_vcpkg_target(cfg: &Config, target_triplet: &TargetTriplet) -> Result<Vcp
     let lib_path = base.join("lib");
     let bin_path = base.join("bin");
     let include_path = base.join("include");
-    let packages_path = vcpkg_root.join("packages");
 
     Ok(VcpkgTarget {
         lib_path: lib_path,
@@ -1965,9 +1986,57 @@ mod tests {
         clean_env();
     }
 
+    #[test]
+    fn manifest_mode_with_vcpkg_installed_root() {
+        let _g = LOCK.lock();
+        clean_env();
+
+        // Set VCPKG_INSTALLED_ROOT to point to the installed directory
+        // without setting VCPKG_ROOT - this simulates manifest mode
+        let installed_path = vcpkg_test_tree_loc("normalized").join("installed");
+        env::set_var("VCPKG_INSTALLED_ROOT", &installed_path);
+        env::set_var("TARGET", "x86_64-pc-windows-msvc");
+        let tmp_dir = tempdir().unwrap();
+        env::set_var("OUT_DIR", tmp_dir.path());
+        env::set_var("CARGO_CFG_TARGET_FEATURE", "crt-static");
+
+        // Should succeed even without VCPKG_ROOT set
+        println!("Result is {:?}", ::find_package("libmysql"));
+        assert!(match ::find_package("libmysql") {
+            Ok(_) => true,
+            _ => false,
+        });
+        clean_env();
+    }
+
+    #[test]
+    fn manifest_mode_with_vcpkg_installed_root_config() {
+        let _g = LOCK.lock();
+        clean_env();
+
+        // Set vcpkg_installed_root via config without VCPKG_ROOT
+        let installed_path = vcpkg_test_tree_loc("normalized").join("installed");
+        env::set_var("TARGET", "x86_64-pc-windows-msvc");
+        let tmp_dir = tempdir().unwrap();
+        env::set_var("OUT_DIR", tmp_dir.path());
+        env::set_var("CARGO_CFG_TARGET_FEATURE", "crt-static");
+
+        // Should succeed even without VCPKG_ROOT set
+        let result = ::Config::new()
+            .vcpkg_installed_root(installed_path)
+            .find_package("libmysql");
+        println!("Result is {:?}", result);
+        assert!(match result {
+            Ok(_) => true,
+            _ => false,
+        });
+        clean_env();
+    }
+
     fn clean_env() {
         env::remove_var("TARGET");
         env::remove_var("VCPKG_ROOT");
+        env::remove_var("VCPKG_INSTALLED_ROOT");
         env::remove_var("VCPKGRS_DYNAMIC");
         env::remove_var("RUSTFLAGS");
         env::remove_var("CARGO_CFG_TARGET_FEATURE");
